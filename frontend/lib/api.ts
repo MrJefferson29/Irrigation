@@ -1,9 +1,6 @@
 export type IrrigationStatus = {
-  /** Estimated soil moisture 0–100 (100 = wet). Derived from ESP32 ADC when device sends sensorRaw. */
   moistureLevel: number;
-  /** Last ESP32 ADC reading 0–4095 (e.g. GPIO34); higher = drier for typical capacitive probes. */
   sensorRaw: number | null;
-  /** Server dry threshold in ADC counts; set ESP_DRY_THRESHOLD_RAW in backend .env to match firmware. */
   dryThresholdRaw: number | null;
   pumpOn: boolean;
   lastSensorUpdate: string;
@@ -16,18 +13,31 @@ export type Reminder = {
   done: boolean;
 };
 
-const API_BASE_URL = "http://10.60.14.100:5000";
+export type HealthStatus = {
+  ok: boolean;
+  storage: "mongodb" | "json";
+  openAiConfigured: boolean;
+};
+
+const API_BASE_URL = (process.env.EXPO_PUBLIC_API_URL ?? "http://localhost:5000").replace(/\/$/, "");
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    headers: {
-      "Content-Type": "application/json",
-    },
-    ...init,
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      headers: {
+        "Content-Type": "application/json",
+      },
+      ...init,
+    });
+  } catch {
+    throw new Error(
+      `Cannot reach the server at ${API_BASE_URL}. Start the backend and set EXPO_PUBLIC_API_URL in frontend/.env to your PC's LAN IP.`,
+    );
+  }
 
   if (!response.ok) {
-    let message = "Request failed.";
+    let message = `Request failed (${response.status}).`;
     try {
       const body = await response.json();
       message = body.message || message;
@@ -53,6 +63,7 @@ function normalizeStatusPayload(data: IrrigationStatus): IrrigationStatus {
 
 export const api = {
   baseUrl: API_BASE_URL,
+  getHealth: () => request<HealthStatus>("/api/health"),
   getStatus: async () => {
     const data = await request<IrrigationStatus>("/api/status");
     return normalizeStatusPayload(data);

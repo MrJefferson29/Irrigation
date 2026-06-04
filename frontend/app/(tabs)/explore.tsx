@@ -1,5 +1,6 @@
 import { useCallback, useState } from "react";
 import {
+  ActivityIndicator,
   Platform,
   Pressable,
   ScrollView,
@@ -8,6 +9,7 @@ import {
   TextInput,
   View,
 } from "react-native";
+import DateTimePicker, { DateTimePickerEvent } from "@react-native-community/datetimepicker";
 import { useFocusEffect } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -16,50 +18,88 @@ import { PrimaryButton } from "@/components/ui/primary-button";
 import { ScreenBackground } from "@/components/ui/screen-background";
 import { SectionHeader } from "@/components/ui/section-header";
 import { AppTheme } from "@/constants/theme";
-import { api, Reminder } from "@/lib/api";
+import {
+  defaultReminderDate,
+  formatDisplayDate,
+  formatDueDateInput,
+  parseDueDate,
+  reminderStatus,
+} from "@/lib/datetime";
+import { api, HealthStatus, Reminder } from "@/lib/api";
+
+const STATUS_COLORS = {
+  overdue: "#f87171",
+  today: "#fbbf24",
+  upcoming: AppTheme.accent.teal,
+  done: AppTheme.text.muted,
+};
 
 export default function RemindersScreen() {
   const insets = useSafeAreaInsets();
   const [reminders, setReminders] = useState<Reminder[]>([]);
   const [title, setTitle] = useState("");
-  const [dueAt, setDueAt] = useState("");
+  const [dueDate, setDueDate] = useState(defaultReminderDate);
+  const [showPicker, setShowPicker] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [health, setHealth] = useState<HealthStatus | null>(null);
 
   const loadReminders = useCallback(async () => {
     try {
       setError(null);
-      setReminders(await api.getReminders());
+      const [items, healthStatus] = await Promise.all([api.getReminders(), api.getHealth()]);
+      setReminders(items);
+      setHealth(healthStatus);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "Unable to load reminders.");
+      setHealth(null);
+    } finally {
+      setLoading(false);
     }
   }, []);
 
   useFocusEffect(
     useCallback(() => {
+      setLoading(true);
       loadReminders();
     }, [loadReminders]),
   );
 
+  const onPickerChange = (_event: DateTimePickerEvent, selected?: Date) => {
+    if (Platform.OS === "android") {
+      setShowPicker(false);
+    }
+    if (selected) {
+      setDueDate(selected);
+    }
+  };
+
   const addReminder = async () => {
-    if (!title.trim() || !dueAt.trim()) {
-      setError("Please provide both task title and due date/time.");
+    if (!title.trim()) {
+      setError("Please enter a task title.");
       return;
     }
 
-    const parsedDate = new Date(dueAt);
-    if (Number.isNaN(parsedDate.getTime())) {
-      setError("Due date format is invalid. Example: 2026-05-30 06:00");
+    const parsed = parseDueDate(formatDueDateInput(dueDate));
+    if (!parsed) {
+      setError("Please choose a valid due date and time.");
       return;
     }
 
     try {
+      setSaving(true);
       setError(null);
-      const created = await api.createReminder(title.trim(), parsedDate.toISOString());
-      setReminders((prev) => [created, ...prev]);
+      const created = await api.createReminder(title.trim(), parsed.toISOString());
+      setReminders((prev) =>
+        [...prev, created].sort((a, b) => new Date(a.dueAt).getTime() - new Date(b.dueAt).getTime()),
+      );
       setTitle("");
-      setDueAt("");
+      setDueDate(defaultReminderDate());
     } catch (addError) {
       setError(addError instanceof Error ? addError.message : "Unable to add reminder.");
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -93,9 +133,21 @@ export default function RemindersScreen() {
         ]}
         showsVerticalScrollIndicator={false}>
         <SectionHeader
-          title="Farm tasks"
-          subtitle="Schedule weeding, fertilizer, harvest, and other field work."
+          title="Farm alerts"
+          subtitle="Schedule irrigation, fertilizer, and harvest reminders."
         />
+
+        <GlassCard contentStyle={styles.statusCard}>
+          <View style={styles.statusRow}>
+            <View style={[styles.statusDot, { backgroundColor: health?.ok ? "#22c55e" : "#ef4444" }]} />
+            <Text style={styles.statusText}>
+              {health?.ok
+                ? `Connected · ${health.storage === "mongodb" ? "MongoDB" : "Local JSON storage"}`
+                : "Server offline — check EXPO_PUBLIC_API_URL"}
+            </Text>
+          </View>
+          <Text style={styles.statusUrl}>{api.baseUrl}</Text>
+        </GlassCard>
 
         {error ? (
           <View style={styles.errorBanner}>
@@ -104,55 +156,85 @@ export default function RemindersScreen() {
         ) : null}
 
         <GlassCard prominent>
-          <Text style={styles.cardEyebrow}>New reminder</Text>
+          <Text style={styles.cardEyebrow}>New alert</Text>
           <Text style={styles.label}>Task</Text>
           <TextInput
             style={styles.input}
             value={title}
             onChangeText={setTitle}
-            placeholder="e.g. Apply nitrogen fertilizer"
+            placeholder="e.g. Irrigate north field"
             placeholderTextColor={AppTheme.text.muted}
           />
           <Text style={styles.label}>Due date & time</Text>
-          <TextInput
-            style={styles.input}
-            value={dueAt}
-            onChangeText={setDueAt}
-            placeholder="YYYY-MM-DD HH:mm"
-            placeholderTextColor={AppTheme.text.muted}
-          />
-          <PrimaryButton label="Add reminder" onPress={addReminder} />
+          <Pressable style={styles.dateButton} onPress={() => setShowPicker(true)}>
+            <Text style={styles.dateButtonText}>{formatDueDateInput(dueDate)}</Text>
+            <Text style={styles.dateButtonHint}>Tap to change</Text>
+          </Pressable>
+          {showPicker ? (
+            <DateTimePicker
+              value={dueDate}
+              mode="datetime"
+              display={Platform.OS === "ios" ? "spinner" : "default"}
+              onChange={onPickerChange}
+              minimumDate={new Date()}
+            />
+          ) : null}
+          {Platform.OS === "ios" && showPicker ? (
+            <Pressable style={styles.donePicker} onPress={() => setShowPicker(false)}>
+              <Text style={styles.donePickerText}>Done</Text>
+            </Pressable>
+          ) : null}
+          <PrimaryButton label={saving ? "Saving…" : "Save alert"} onPress={addReminder} disabled={saving} />
         </GlassCard>
 
-        {reminders.length === 0 ? (
+        {loading ? (
+          <GlassCard contentStyle={styles.loadingCard}>
+            <ActivityIndicator color={AppTheme.accent.teal} />
+            <Text style={styles.loadingText}>Loading alerts…</Text>
+          </GlassCard>
+        ) : reminders.length === 0 ? (
           <GlassCard>
-            <Text style={styles.emptyTitle}>No tasks yet</Text>
-            <Text style={styles.emptyBody}>Add your first farm reminder above.</Text>
+            <Text style={styles.emptyTitle}>No alerts yet</Text>
+            <Text style={styles.emptyBody}>Saved reminders appear here and persist on the server.</Text>
           </GlassCard>
         ) : (
-          reminders.map((item) => (
-            <GlassCard key={item.id}>
-              <View style={styles.taskRow}>
-                <View style={[styles.taskAccent, item.done && styles.taskAccentDone]} />
-                <View style={styles.taskBody}>
-                  <Text style={[styles.taskText, item.done && styles.taskDone]}>{item.title}</Text>
-                  <Text style={styles.timeText}>
-                    Due {new Date(item.dueAt).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}
-                  </Text>
+          reminders.map((item) => {
+            const status = reminderStatus(item.dueAt, item.done);
+            return (
+              <GlassCard key={item.id}>
+                <View style={styles.taskRow}>
+                  <View style={[styles.taskAccent, { backgroundColor: STATUS_COLORS[status] }]} />
+                  <View style={styles.taskBody}>
+                    <View style={styles.taskTitleRow}>
+                      <Text style={[styles.taskText, item.done && styles.taskDone]}>{item.title}</Text>
+                      <View style={[styles.statusPill, { borderColor: STATUS_COLORS[status] }]}>
+                        <Text style={[styles.statusPillText, { color: STATUS_COLORS[status] }]}>
+                          {status === "done"
+                            ? "Done"
+                            : status === "overdue"
+                              ? "Overdue"
+                              : status === "today"
+                                ? "Today"
+                                : "Upcoming"}
+                        </Text>
+                      </View>
+                    </View>
+                    <Text style={styles.timeText}>Due {formatDisplayDate(item.dueAt)}</Text>
+                  </View>
                 </View>
-              </View>
-              <View style={styles.row}>
-                <Pressable
-                  style={[styles.chip, styles.chipPrimary]}
-                  onPress={() => toggleReminder(item.id, item.done)}>
-                  <Text style={styles.chipText}>{item.done ? "Undo" : "Done"}</Text>
-                </Pressable>
-                <Pressable style={[styles.chip, styles.chipDanger]} onPress={() => removeReminder(item.id)}>
-                  <Text style={styles.chipText}>Delete</Text>
-                </Pressable>
-              </View>
-            </GlassCard>
-          ))
+                <View style={styles.row}>
+                  <Pressable
+                    style={[styles.chip, styles.chipPrimary]}
+                    onPress={() => toggleReminder(item.id, item.done)}>
+                    <Text style={styles.chipText}>{item.done ? "Undo" : "Mark done"}</Text>
+                  </Pressable>
+                  <Pressable style={[styles.chip, styles.chipDanger]} onPress={() => removeReminder(item.id)}>
+                    <Text style={styles.chipText}>Delete</Text>
+                  </Pressable>
+                </View>
+              </GlassCard>
+            );
+          })
         )}
       </ScrollView>
     </ScreenBackground>
@@ -163,6 +245,30 @@ const styles = StyleSheet.create({
   scroll: {
     paddingHorizontal: 20,
     gap: 14,
+  },
+  statusCard: {
+    gap: 6,
+    paddingVertical: 12,
+  },
+  statusRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  statusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+  },
+  statusText: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: AppTheme.text.primary,
+  },
+  statusUrl: {
+    fontSize: 11,
+    color: AppTheme.text.muted,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
   },
   cardEyebrow: {
     fontSize: 12,
@@ -187,6 +293,37 @@ const styles = StyleSheet.create({
     color: AppTheme.text.primary,
     backgroundColor: "rgba(0, 0, 0, 0.2)",
   },
+  dateButton: {
+    borderWidth: 1,
+    borderColor: AppTheme.glass.borderStrong,
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    backgroundColor: "rgba(20, 184, 166, 0.12)",
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  dateButtonText: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: AppTheme.text.primary,
+    fontVariant: ["tabular-nums"],
+  },
+  dateButtonHint: {
+    fontSize: 12,
+    color: AppTheme.text.muted,
+  },
+  donePicker: {
+    alignSelf: "flex-end",
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+  },
+  donePickerText: {
+    color: AppTheme.accent.teal,
+    fontWeight: "700",
+    fontSize: 16,
+  },
   taskRow: {
     flexDirection: "row",
     gap: 12,
@@ -194,17 +331,20 @@ const styles = StyleSheet.create({
   taskAccent: {
     width: 4,
     borderRadius: 2,
-    backgroundColor: AppTheme.accent.teal,
     alignSelf: "stretch",
-  },
-  taskAccentDone: {
-    backgroundColor: AppTheme.text.muted,
   },
   taskBody: {
     flex: 1,
-    gap: 4,
+    gap: 6,
+  },
+  taskTitleRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: 8,
   },
   taskText: {
+    flex: 1,
     fontSize: 17,
     fontWeight: "700",
     color: AppTheme.text.primary,
@@ -212,6 +352,18 @@ const styles = StyleSheet.create({
   taskDone: {
     textDecorationLine: "line-through",
     color: AppTheme.text.muted,
+  },
+  statusPill: {
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  statusPillText: {
+    fontSize: 10,
+    fontWeight: "800",
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
   },
   timeText: {
     fontSize: 13,
@@ -250,6 +402,15 @@ const styles = StyleSheet.create({
   emptyBody: {
     fontSize: 14,
     color: AppTheme.text.secondary,
+  },
+  loadingCard: {
+    alignItems: "center",
+    gap: 10,
+    paddingVertical: 24,
+  },
+  loadingText: {
+    color: AppTheme.text.secondary,
+    fontSize: 14,
   },
   errorBanner: {
     backgroundColor: AppTheme.status.errorBg,

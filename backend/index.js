@@ -5,6 +5,10 @@ const fs = require("fs");
 const path = require("path");
 const morgan = require("morgan");
 
+const { connectDb, isDbConnected } = require("./db");
+const Reminder = require("./models/Reminder");
+const { parseDueDate } = require("./lib/dates");
+
 dotenv.config();
 
 const app = express();
@@ -168,47 +172,139 @@ function patchStoreFields(fields) {
   return store;
 }
 
-async function generateAiReply(message) {
-  const openAiKey = process.env.OPENAI_API_KEY;
-  if (!openAiKey) {
-    return "I can help with irrigation, soil moisture, pests, and fertilizer schedules. Add OPENAI_API_KEY in backend .env for smarter AI responses.";
+function normalizeReminderRecord(record) {
+  return {
+    id: String(record.id),
+    title: String(record.title).trim(),
+    dueAt: new Date(record.dueAt).toISOString(),
+    done: Boolean(record.done),
+  };
+}
+
+async function listReminders() {
+  if (isDbConnected()) {
+    const rows = await Reminder.find().sort({ dueAt: 1 }).lean();
+    return rows.map((row) =>
+      normalizeReminderRecord({
+        id: row._id,
+        title: row.title,
+        dueAt: row.dueAt,
+        done: row.done,
+      }),
+    );
+  }
+  return readStore().reminders.map(normalizeReminderRecord);
+}
+
+async function createReminderRecord(title, dueAt) {
+  if (isDbConnected()) {
+    const created = await Reminder.create({ title, dueAt, done: false });
+    return normalizeReminderRecord({
+      id: created.id,
+      title: created.title,
+      dueAt: created.dueAt,
+      done: created.done,
+    });
   }
 
+  const store = readStore();
+  const reminder = {
+    id: `${Date.now()}`,
+    title,
+    dueAt: dueAt.toISOString(),
+    done: false,
+  };
+  store.reminders.push(reminder);
+  writeStore(store);
+  return normalizeReminderRecord(reminder);
+}
+
+async function updateReminderRecord(id, done) {
+  if (isDbConnected()) {
+    const updated = await Reminder.findByIdAndUpdate(id, { done }, { new: true });
+    if (!updated) {
+      return null;
+    }
+    return normalizeReminderRecord({
+      id: updated.id,
+      title: updated.title,
+      dueAt: updated.dueAt,
+      done: updated.done,
+    });
+  }
+
+  const store = readStore();
+  const reminder = store.reminders.find((item) => item.id === id);
+  if (!reminder) {
+    return null;
+  }
+  reminder.done = done;
+  writeStore(store);
+  return normalizeReminderRecord(reminder);
+}
+
+async function deleteReminderRecord(id) {
+  if (isDbConnected()) {
+    const result = await Reminder.findByIdAndDelete(id);
+    return Boolean(result);
+  }
+
+  const store = readStore();
+  const before = store.reminders.length;
+  store.reminders = store.reminders.filter((item) => item.id !== id);
+  if (store.reminders.length === before) {
+    return false;
+  }
+  writeStore(store);
+  return true;
+}
+
+async function generateAiReply(message) {
+  const openAiKey = process.env.OPENAI_API_KEY?.trim();
+  if (!openAiKey) {
+    return "I can help with irrigation, soil moisture, pests, and fertilizer schedules. Add OPENAI_API_KEY in backend/.env for full AI responses.";
+  }
+
+  const model = process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
+
   try {
-    const response = await fetch("https://api.openai.com/v1/responses", {
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${openAiKey}`,
       },
       body: JSON.stringify({
-        model: "gpt-4.1-mini",
-        input: [
+        model,
+        messages: [
           {
             role: "system",
             content:
-              "You are an agronomy assistant. Give concise, practical farm guidance about crops, irrigation, and soil care.",
+              "You are an expert agronomy assistant for small farms. Give concise, practical guidance on irrigation, soil moisture, crop care, pests, and fertilizer. Use bullet points when listing steps.",
           },
-          {
-            role: "user",
-            content: message,
-          },
+          { role: "user", content: message },
         ],
+        max_tokens: 600,
+        temperature: 0.7,
       }),
     });
 
+    const data = await response.json();
     if (!response.ok) {
-      throw new Error(`OpenAI API failed: ${response.status}`);
+      const apiMessage = data?.error?.message || `HTTP ${response.status}`;
+      console.error("[chat] OpenAI error:", apiMessage);
+      throw new Error(apiMessage);
     }
 
-    const data = await response.json();
-    if (data.output_text) {
-      return data.output_text;
+    const text = data.choices?.[0]?.message?.content?.trim();
+    if (text) {
+      return text;
     }
 
     return "I could not parse an AI response. Please try again.";
   } catch (error) {
-    return `AI service is temporarily unavailable (${error.message}).`;
+    console.error("[chat] OpenAI request failed:", error.message);
+    return `AI service is temporarily unavailable (${error.message}). Check OPENAI_API_KEY and your network connection.`;
   }
 }
 
@@ -286,64 +382,79 @@ app.post("/api/sensor", (req, res) => {
   });
 });
 
-app.get("/api/reminders", (_req, res) => {
-  const store = readStore();
-  res.json(store.reminders);
+app.get("/api/health", (_req, res) => {
+  res.json({
+    ok: true,
+    storage: isDbConnected() ? "mongodb" : "json",
+    openAiConfigured: Boolean(process.env.OPENAI_API_KEY?.trim()),
+  });
 });
 
-app.post("/api/reminders", (req, res) => {
+app.get("/api/reminders", async (_req, res) => {
+  try {
+    const reminders = await listReminders();
+    return res.json(reminders);
+  } catch (error) {
+    console.error("[reminders] list failed:", error.message);
+    return res.status(500).json({ message: "Unable to load reminders." });
+  }
+});
+
+app.post("/api/reminders", async (req, res) => {
   const { title, dueAt } = req.body || {};
-  if (!title || !dueAt) {
+  const trimmedTitle = typeof title === "string" ? title.trim() : "";
+  if (!trimmedTitle || dueAt == null || dueAt === "") {
     return res.status(400).json({ message: "title and dueAt are required." });
   }
 
-  const dueDate = new Date(dueAt);
-  if (Number.isNaN(dueDate.getTime())) {
-    return res.status(400).json({ message: "dueAt must be a valid date." });
+  const dueDate = parseDueDate(dueAt);
+  if (!dueDate) {
+    return res.status(400).json({
+      message: "dueAt must be a valid date (ISO string or YYYY-MM-DD HH:mm).",
+    });
   }
 
-  const store = readStore();
-  const reminder = {
-    id: `${Date.now()}`,
-    title: String(title).trim(),
-    dueAt: dueDate.toISOString(),
-    done: false,
-  };
-  store.reminders.push(reminder);
-  writeStore(store);
-  return res.status(201).json(reminder);
+  try {
+    const reminder = await createReminderRecord(trimmedTitle, dueDate);
+    return res.status(201).json(reminder);
+  } catch (error) {
+    console.error("[reminders] create failed:", error.message);
+    return res.status(500).json({ message: "Unable to save reminder." });
+  }
 });
 
-app.patch("/api/reminders/:id", (req, res) => {
+app.patch("/api/reminders/:id", async (req, res) => {
   const { id } = req.params;
   const { done } = req.body || {};
   if (typeof done !== "boolean") {
     return res.status(400).json({ message: "done must be a boolean." });
   }
 
-  const store = readStore();
-  const reminder = store.reminders.find((item) => item.id === id);
-  if (!reminder) {
-    return res.status(404).json({ message: "Reminder not found." });
+  try {
+    const reminder = await updateReminderRecord(id, done);
+    if (!reminder) {
+      return res.status(404).json({ message: "Reminder not found." });
+    }
+    return res.json(reminder);
+  } catch (error) {
+    console.error("[reminders] update failed:", error.message);
+    return res.status(500).json({ message: "Unable to update reminder." });
   }
-
-  reminder.done = done;
-  writeStore(store);
-  return res.json(reminder);
 });
 
-app.delete("/api/reminders/:id", (req, res) => {
+app.delete("/api/reminders/:id", async (req, res) => {
   const { id } = req.params;
-  const store = readStore();
-  const before = store.reminders.length;
-  store.reminders = store.reminders.filter((item) => item.id !== id);
 
-  if (store.reminders.length === before) {
-    return res.status(404).json({ message: "Reminder not found." });
+  try {
+    const deleted = await deleteReminderRecord(id);
+    if (!deleted) {
+      return res.status(404).json({ message: "Reminder not found." });
+    }
+    return res.status(204).send();
+  } catch (error) {
+    console.error("[reminders] delete failed:", error.message);
+    return res.status(500).json({ message: "Unable to delete reminder." });
   }
-
-  writeStore(store);
-  return res.status(204).send();
 });
 
 app.post("/api/chat", async (req, res) => {
@@ -360,6 +471,16 @@ app.get("/", (_req, res) => {
   res.send("Smart Irrigation API is running.");
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Backend server listening on http://0.0.0.0:${PORT} (LAN: use this machine's IP)`);
+async function startServer() {
+  await connectDb();
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Backend server listening on http://0.0.0.0:${PORT} (LAN: use this machine's IP)`);
+    console.log(`Reminders storage: ${isDbConnected() ? "MongoDB" : "data/store.json"}`);
+    console.log(`OpenAI chat: ${process.env.OPENAI_API_KEY?.trim() ? "configured" : "not configured"}`);
+  });
+}
+
+startServer().catch((error) => {
+  console.error("Failed to start server:", error);
+  process.exit(1);
 });
